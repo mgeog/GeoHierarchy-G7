@@ -10,6 +10,7 @@ import {
   Municipality,
   SubDivision,
 } from '../types/geo';
+import { MAP_THEMES } from '../utils/theme';
 import {
   ZoomIn,
   ZoomOut,
@@ -117,22 +118,74 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   const subDivisionMarkersLayerRef = useRef<L.LayerGroup | null>(null);
   const cityMarkersLayerRef = useRef<L.LayerGroup | null>(null);
 
-  const [currentZoom, setCurrentZoom] = useState<number>(country.defaultZoom || 5.0);
+  const [currentZoom, setCurrentZoom] = useState<number>(country.zoomLevels?.level1 || country.defaultZoom || 4.0);
   const [activeBasemap, setActiveBasemap] = useState<BasemapKey>('osm');
   const [geoJsonData, setGeoJsonData] = useState<any | null>(null);
   const [isLoadingGeoJson, setIsLoadingGeoJson] = useState<boolean>(false);
   const [showBasemapMenu, setShowBasemapMenu] = useState<boolean>(false);
+  const prevCountryIdRef = useRef<string>(country.id);
+  const prevDisplayModeRef = useRef<HierarchyDisplayMode>(displayMode);
+  const prevSelectedEntityIdRef = useRef<string | null>(null);
 
-  // Derive effective level
+  // Safe navigation wrapper avoiding Leaflet (NaN, NaN) flyTo exceptions when size is 0
+  const safeNavigateTo = useCallback((lat?: number, lng?: number, zoom?: number) => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+    if (lat == null || lng == null || isNaN(lat) || isNaN(lng)) return;
+
+    try {
+      map.invalidateSize();
+      const size = map.getSize();
+      const targetZoom = zoom ?? country.zoomLevels?.level1 ?? country.defaultZoom ?? 4.0;
+
+      if (size && size.x > 0 && size.y > 0) {
+        map.flyTo([lat, lng], targetZoom, { duration: 1.0 });
+        return;
+      }
+    } catch (e) {
+      console.warn('flyTo exception caught, falling back to setView:', e);
+    }
+
+    try {
+      map.setView([lat, lng], zoom ?? country.zoomLevels?.level1 ?? country.defaultZoom ?? 4.0);
+    } catch (e) {
+      console.warn('setView failed:', e);
+    }
+  }, [country.zoomLevels, country.defaultZoom]);
+
+  // Synchronize basemap when aesthetic theme changes
+  useEffect(() => {
+    if (theme === 'blueprint') {
+      setActiveBasemap('satellite');
+    } else if (theme === 'minimal') {
+      setActiveBasemap('gray');
+    } else if (theme === 'textbook') {
+      setActiveBasemap('esriTopo');
+    } else {
+      setActiveBasemap('osm');
+    }
+  }, [theme]);
+
+  // Derive effective level - progressive scale disclosure relative to each country's calibrated zoomLevels
   const effectiveLevel: AdminLevel = useMemo(() => {
     if (displayMode !== 'auto') {
       return displayMode;
     }
-    // Scale-adaptive breakpoints based on Leaflet zoom
-    if (currentZoom < 4.5) return 1;
-    if (currentZoom < 7.2) return 2;
-    return 3;
-  }, [displayMode, currentZoom]);
+    const { level1, level2, level3, level4 } = country.zoomLevels || {
+      level1: 4.0,
+      level2: 5.0,
+      level3: 6.0,
+      level4: 7.0,
+    };
+    const t12 = (level1 + level2) / 2;
+    const t23 = (level2 + level3) / 2;
+    const t34 = (level3 + level4) / 2;
+
+    if (currentZoom < t12) return 1;
+    if (currentZoom < t23) return 2;
+    if (currentZoom < t34) return 3;
+    return 4;
+  }, [displayMode, currentZoom, country.zoomLevels]);
 
   // Quick lookup for MacroRegions
   const macroMap = useMemo(() => {
@@ -213,14 +266,33 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     [country.geoJsonNameProp, country.subDivisions, subDivisionMap]
   );
 
+  // Observe container size to keep Leaflet viewport geometry synchronized
+  useEffect(() => {
+    if (!mapContainerRef.current) return;
+    const container = mapContainerRef.current;
+    const observer = new ResizeObserver(() => {
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.invalidateSize();
+      }
+    });
+    observer.observe(container);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
   // Initialize Leaflet Map
   useEffect(() => {
     if (!mapContainerRef.current) return;
 
     if (!mapInstanceRef.current) {
+      const lat = country.center?.[1] ?? 36.5;
+      const lng = country.center?.[0] ?? 137.5;
+      const zoom = country.defaultZoom || 5.0;
+
       const map = L.map(mapContainerRef.current, {
-        center: [country.center[1], country.center[0]],
-        zoom: country.defaultZoom || 5.0,
+        center: [lat, lng],
+        zoom,
         zoomControl: false,
         attributionControl: true,
       });
@@ -246,22 +318,92 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       });
 
       mapInstanceRef.current = map;
+
+      // Invalidate size once DOM layout is settled
+      setTimeout(() => {
+        if (mapInstanceRef.current) {
+          mapInstanceRef.current.invalidateSize();
+        }
+      }, 100);
     }
 
     return () => {
-      // Map cleanup if needed
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.remove();
+        mapInstanceRef.current = null;
+      }
     };
   }, []);
 
-  // Update center & zoom when country changes
+  // Update center & zoom ONLY when country genuinely changes
   useEffect(() => {
     if (!mapInstanceRef.current) return;
-    mapInstanceRef.current.flyTo(
-      [country.center[1], country.center[0]],
-      country.defaultZoom || 5.0,
-      { duration: 1.0 }
-    );
-  }, [country.id]);
+    if (prevCountryIdRef.current === country.id) return;
+    prevCountryIdRef.current = country.id;
+
+    const targetZoom =
+      displayMode !== 'auto'
+        ? country.zoomLevels[`level${displayMode}`]
+        : country.zoomLevels.level1;
+
+    safeNavigateTo(country.center[1], country.center[0], targetZoom);
+  }, [country.id, country.center, country.zoomLevels, displayMode, safeNavigateTo]);
+
+  // Update zoom when displayMode is changed by user clicking hierarchy buttons
+  useEffect(() => {
+    if (!mapInstanceRef.current) return;
+    if (prevDisplayModeRef.current === displayMode) return;
+    prevDisplayModeRef.current = displayMode;
+
+    if (displayMode !== 'auto') {
+      const targetZoom = country.zoomLevels[`level${displayMode}`];
+      if (typeof targetZoom === 'number') {
+        const center = mapInstanceRef.current.getCenter();
+        safeNavigateTo(center.lat, center.lng, targetZoom);
+      }
+    }
+  }, [displayMode, country.zoomLevels, safeNavigateTo]);
+
+  // Navigate when selectedEntity changes (from search or direct click)
+  useEffect(() => {
+    if (!mapInstanceRef.current) return;
+    if (!selectedEntity) {
+      prevSelectedEntityIdRef.current = null;
+      return;
+    }
+    const currentId = `${selectedEntity.type}-${selectedEntity.item.id}`;
+    if (prevSelectedEntityIdRef.current === currentId) return;
+    prevSelectedEntityIdRef.current = currentId;
+
+    if (selectedEntity.type === 'macro') {
+      const macro = selectedEntity.item as MacroRegion;
+      if (macro.centroid) {
+        safeNavigateTo(
+          macro.centroid[1],
+          macro.centroid[0],
+          country.zoomLevels.level1 + 0.6
+        );
+      }
+    } else if (selectedEntity.type === 'subdivision') {
+      const sub = selectedEntity.item as SubDivision;
+      if (sub.centroid) {
+        safeNavigateTo(
+          sub.centroid[1],
+          sub.centroid[0],
+          country.zoomLevels.level2 + 0.8
+        );
+      }
+    } else if (selectedEntity.type === 'municipality') {
+      const mun = selectedEntity.item as Municipality;
+      if (mun.coordinates) {
+        safeNavigateTo(
+          mun.coordinates[1],
+          mun.coordinates[0],
+          Math.max(country.zoomLevels.level4, 7.2)
+        );
+      }
+    }
+  }, [selectedEntity, country.zoomLevels, safeNavigateTo]);
 
   // Update Basemap Tiles
   useEffect(() => {
@@ -279,14 +421,20 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     tileLayerRef.current = tile;
   }, [activeBasemap]);
 
-  // Fetch GeoJSON file
+  // Fetch GeoJSON file with GitHub Pages base URL resolution
   useEffect(() => {
     let isCancelled = false;
     if (country.geoJsonUrl) {
       setIsLoadingGeoJson(true);
-      fetch(country.geoJsonUrl)
+      const rawUrl = country.geoJsonUrl;
+      const baseUrl = import.meta.env.BASE_URL || '/';
+      const cleanBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+      const cleanPath = rawUrl.startsWith('/') ? rawUrl.slice(1) : rawUrl;
+      const resolvedUrl = rawUrl.startsWith('http') ? rawUrl : `${cleanBase}${cleanPath}`;
+
+      fetch(resolvedUrl)
         .then((res) => {
-          if (!res.ok) throw new Error('Failed to load GeoJSON');
+          if (!res.ok) throw new Error(`Failed to load GeoJSON: ${res.status}`);
           return res.json();
         })
         .then((data) => {
@@ -311,7 +459,83 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     };
   }, [country.id, country.geoJsonUrl]);
 
-  // Render GeoJSON Layer with Real Natural Earth Polygons
+  // Dynamic styling calculation for GeoJSON polygons
+  const getFeatureStyle = useCallback(
+    (feature: any) => {
+      const sub = findSubDivisionForFeature(feature?.properties);
+      const macro = sub ? macroMap.get(sub.macroRegionId) : undefined;
+
+      const isSelected =
+        selectedEntity?.type === 'subdivision' &&
+        selectedEntity.item.id === sub?.id;
+      const isMacroSelected =
+        selectedEntity?.type === 'macro' &&
+        selectedEntity.item.id === sub?.macroRegionId;
+
+      // Quiz feedback pulse
+      const isLastTargetHit =
+        sub &&
+        lastAnswerFeedback &&
+        (lastAnswerFeedback.id === sub.id ||
+          lastAnswerFeedback.id === sub.macroRegionId);
+      const feedbackColor =
+        isLastTargetHit && lastAnswerFeedback
+          ? lastAnswerFeedback.correct
+            ? '#22c55e'
+            : '#ef4444'
+          : null;
+
+      const themeStyles = MAP_THEMES[theme] || MAP_THEMES.educational;
+
+      let fillColor = macro ? macro.color : '#94a3b8';
+      if (theme === 'blueprint') {
+        fillColor = isSelected ? '#0284c7' : '#1e293b';
+      } else if (theme === 'minimal') {
+        fillColor = isSelected ? '#334155' : '#f8fafc';
+      } else if (theme === 'textbook') {
+        fillColor = macro ? macro.color : themeStyles.subdivisionDefaultFill;
+      }
+
+      if (feedbackColor) fillColor = feedbackColor;
+      else if (isSelected || isMacroSelected) fillColor = '#0284c7';
+
+      let fillOpacity = 0.32;
+      if (theme === 'blueprint') fillOpacity = 0.55;
+      else if (theme === 'minimal') fillOpacity = 0.22;
+      else if (theme === 'textbook') fillOpacity = 0.38;
+
+      if (effectiveLevel === 1) fillOpacity += 0.1;
+      if (isSelected || isMacroSelected) fillOpacity = 0.65;
+      if (feedbackColor) fillOpacity = 0.8;
+
+      let strokeColor = themeStyles.subdivisionStroke;
+      if (feedbackColor) strokeColor = feedbackColor;
+      else if (isSelected) strokeColor = '#0284c7';
+      else if (theme === 'blueprint') strokeColor = '#38bdf8';
+      else if (theme === 'minimal') strokeColor = '#0f172a';
+      else if (effectiveLevel === 1) strokeColor = '#64748b';
+
+      const weight = isSelected ? 3.5 : effectiveLevel === 1 ? 1.2 : 1.8;
+
+      return {
+        fillColor,
+        fillOpacity,
+        color: strokeColor,
+        weight,
+        dashArray: effectiveLevel === 1 ? '3, 4' : undefined,
+      };
+    },
+    [
+      findSubDivisionForFeature,
+      macroMap,
+      selectedEntity,
+      lastAnswerFeedback,
+      theme,
+      effectiveLevel,
+    ]
+  );
+
+  // Render GeoJSON Layer with Real Natural Earth Polygons (re-created ONLY when GeoJSON data changes)
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map) return;
@@ -324,58 +548,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     if (!geoJsonData) return;
 
     const layer = L.geoJSON(geoJsonData, {
-      style: (feature) => {
-        const sub = findSubDivisionForFeature(feature?.properties);
-        const macro = sub ? macroMap.get(sub.macroRegionId) : undefined;
-
-        const isSelected =
-          selectedEntity?.type === 'subdivision' &&
-          selectedEntity.item.id === sub?.id;
-        const isMacroSelected =
-          selectedEntity?.type === 'macro' &&
-          selectedEntity.item.id === sub?.macroRegionId;
-
-        // Quiz feedback pulse
-        const isLastTargetHit =
-          sub &&
-          lastAnswerFeedback &&
-          (lastAnswerFeedback.id === sub.id ||
-            lastAnswerFeedback.id === sub.macroRegionId);
-        const feedbackColor =
-          isLastTargetHit && lastAnswerFeedback
-            ? lastAnswerFeedback.correct
-              ? '#22c55e'
-              : '#ef4444'
-            : null;
-
-        let fillColor = macro ? macro.color : '#94a3b8';
-        if (feedbackColor) fillColor = feedbackColor;
-        else if (isSelected || isMacroSelected) fillColor = '#0284c7';
-
-        let fillOpacity = 0.32;
-        if (effectiveLevel === 1) fillOpacity = 0.42;
-        if (effectiveLevel === 2) fillOpacity = 0.35;
-        if (isSelected || isMacroSelected) fillOpacity = 0.65;
-        if (feedbackColor) fillOpacity = 0.8;
-
-        const strokeColor = feedbackColor
-          ? feedbackColor
-          : isSelected
-          ? '#0284c7'
-          : effectiveLevel === 1
-          ? '#64748b'
-          : '#334155';
-
-        const weight = isSelected ? 3.5 : effectiveLevel === 1 ? 1.2 : 1.8;
-
-        return {
-          fillColor,
-          fillOpacity,
-          color: strokeColor,
-          weight,
-          dashArray: effectiveLevel === 1 ? '3, 4' : undefined,
-        };
-      },
+      style: (feature) => getFeatureStyle(feature),
       onEachFeature: (feature, featureLayer) => {
         const sub = findSubDivisionForFeature(feature?.properties);
         if (!sub) return;
@@ -444,32 +617,25 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     }).addTo(map);
 
     geoJsonLayerRef.current = layer;
-
-    // Automatically fit bounds of the loaded country
-    try {
-      const bounds = layer.getBounds();
-      if (bounds.isValid()) {
-        map.fitBounds(bounds, {
-          padding: [24, 24],
-          maxZoom: country.defaultZoom ? country.defaultZoom + 1.0 : 7.5,
-        });
-      }
-    } catch (e) {}
   }, [
     geoJsonData,
-    country,
-    effectiveLevel,
+    country.id,
+    country.defaultZoom,
     isBlindMode,
     isBilingual,
     mode,
     quizTarget,
-    selectedEntity,
-    lastAnswerFeedback,
     findSubDivisionForFeature,
     macroMap,
     onQuizAnswer,
     onSelectEntity,
   ]);
+
+  // Update polygon style dynamically when effectiveLevel, theme, or selection changes WITHOUT resetting view
+  useEffect(() => {
+    if (!geoJsonLayerRef.current) return;
+    geoJsonLayerRef.current.setStyle((feature) => getFeatureStyle(feature));
+  }, [getFeatureStyle]);
 
   // Render Level 1 Macro Region Centroid Badges
   useEffect(() => {
@@ -647,17 +813,26 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     // Show city points when Level >= 2
     if (effectiveLevel < 2) return;
 
-    const isDominant = effectiveLevel === 3;
-
     country.subDivisions.forEach((sub) => {
       sub.municipalities.forEach((city) => {
+        // At Level 2, only render national/prefectural capitals to keep view clean.
+        if (effectiveLevel === 2 && !city.isCapital && !city.isPrefecturalCapital) {
+          return;
+        }
+
         const [lon, lat] = city.coordinates;
         const isSelected =
           selectedEntity?.type === 'municipality' &&
           selectedEntity.item.id === city.id;
 
-        const radius = city.isCapital ? 7 : city.isPrefecturalCapital ? 5.5 : 4;
-        const color = city.isCapital ? '#e11d48' : '#0284c7';
+        const isCapitalCity = city.isCapital || city.isPrefecturalCapital;
+        const isShowPermanentBadge =
+          isSelected ||
+          effectiveLevel === 4 ||
+          (effectiveLevel === 3 && (isCapitalCity || (city.population && city.population > 250000)));
+
+        const radius = city.isCapital ? 7 : city.isPrefecturalCapital ? 5.5 : effectiveLevel === 4 ? 4.5 : 3.5;
+        const color = city.isCapital ? '#e11d48' : city.isPrefecturalCapital ? '#0284c7' : '#10b981';
 
         const marker = L.circleMarker([lat, lon], {
           radius: isSelected ? radius * 1.5 : radius,
@@ -674,11 +849,12 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
           : city.name;
 
         // Tooltip
-        if (isDominant || isSelected) {
+        if (isShowPermanentBadge) {
           marker.bindTooltip(
             `<div class="flex items-center gap-1 font-bold">
               <span>${labelText}</span>
               ${city.isCapital ? '<span class="text-[9px] px-1 bg-rose-600 text-white rounded">首都</span>' : ''}
+              ${effectiveLevel === 4 && city.population ? `<span class="text-[9px] font-normal text-slate-300">(${(city.population / 10000).toFixed(0)}万)</span>` : ''}
             </div>`,
             {
               permanent: true,
@@ -744,23 +920,14 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   };
 
   const handleResetView = () => {
-    if (geoJsonLayerRef.current && mapInstanceRef.current) {
-      try {
-        const bounds = geoJsonLayerRef.current.getBounds();
-        if (bounds.isValid()) {
-          mapInstanceRef.current.fitBounds(bounds, {
-            padding: [24, 24],
-            maxZoom: country.defaultZoom ? country.defaultZoom + 1.0 : 7.5,
-          });
-          return;
-        }
-      } catch (e) {}
-    }
-    mapInstanceRef.current?.flyTo(
-      [country.center[1], country.center[0]],
-      country.defaultZoom || 5.0,
-      { duration: 1.0 }
-    );
+    const map = mapInstanceRef.current;
+    if (!map) return;
+    map.invalidateSize();
+    const targetZoom =
+      displayMode !== 'auto'
+        ? country.zoomLevels[`level${displayMode}`]
+        : country.zoomLevels.level1;
+    safeNavigateTo(country.center[1], country.center[0], targetZoom);
   };
 
   return (
@@ -785,6 +952,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
             {effectiveLevel === 1 && `第1階層: ${country.levelNames.level1.ja}`}
             {effectiveLevel === 2 && `第2階層: ${country.levelNames.level2.ja}`}
             {effectiveLevel === 3 && `第3階層: ${country.levelNames.level3.ja}`}
+            {effectiveLevel === 4 && `第4階層: ${country.levelNames.level4.ja}`}
           </span>
           <span className="text-stone-400">·</span>
           <span className="text-stone-500 font-mono">
